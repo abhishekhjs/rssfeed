@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# App data (don't commit personal history/config)
+posted_history.json
+curator_config.json
+
+# Test scripts
+test_api.py
+test_e2e.py
+list_free_models.py
+
+# OS
+.DS_Store
+Thumbs.db
