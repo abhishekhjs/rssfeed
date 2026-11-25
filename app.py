@@ -363,39 +363,74 @@ def main():
         st.info("👆 Click **Fetch News** to pull articles from your configured feeds.")
         return
 
-    # ── Step 2: Select article
+    # ── Step 2: Article cards
     st.divider()
-    st.subheader("Step 2 — Pick an Article")
+    st.subheader(f"Step 2 — Pick an Article ({len(candidates)} available)")
 
-    options = [
-        f"[{item['source']}]  {item['title']}  ({item['age']})"
-        for item in candidates
-    ]
-    selected_idx = st.selectbox(
-        "Choose an article to curate:",
-        range(len(options)),
-        format_func=lambda i: options[i],
-        index=min(st.session_state.selected_idx, len(candidates) - 1),
-        key="article_select",
-    )
-    # Reset generated post when user picks a different article
-    if selected_idx != st.session_state.selected_idx:
-        st.session_state.selected_idx = selected_idx
-        st.session_state.curated_post = ""
-        st.session_state.ai_parts = {}
+    # Inject CSS for card styling
+    st.markdown("""
+    <style>
+    div[data-testid="stButton"] > button {
+        white-space: normal !important;
+        height: auto !important;
+    }
+    .article-card {
+        border: 1.5px solid #e0e0e0;
+        border-radius: 10px;
+        padding: 14px 16px;
+        margin-bottom: 4px;
+        background: #fafafa;
+        transition: border-color 0.15s;
+    }
+    .article-card.selected {
+        border-color: #ff4b4b;
+        background: #fff5f5;
+    }
+    .card-source { font-size: 11px; color: #888; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+    .card-title  { font-size: 15px; font-weight: 600; color: #111; margin: 4px 0 6px; line-height: 1.4; }
+    .card-meta   { font-size: 12px; color: #aaa; }
+    </style>
+    """, unsafe_allow_html=True)
 
-    item = candidates[selected_idx]
+    COLS = 3  # cards per row
+    rows = [candidates[i:i + COLS] for i in range(0, len(candidates), COLS)]
 
-    with st.expander("📰 Article Preview", expanded=True):
+    for row_items in rows:
+        cols = st.columns(COLS)
+        for col, art in zip(cols, row_items):
+            idx = candidates.index(art)
+            is_selected = (idx == st.session_state.selected_idx)
+            card_class = "article-card selected" if is_selected else "article-card"
+            with col:
+                st.markdown(
+                    f"""<div class="{card_class}">
+                        <div class="card-source">{art['source']}</div>
+                        <div class="card-title">{art['title']}</div>
+                        <div class="card-meta">🕐 {art['age']}</div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+                btn_label = "✅ Selected" if is_selected else "Select"
+                if col.button(btn_label, key=f"card_{idx}", use_container_width=True):
+                    if idx != st.session_state.selected_idx:
+                        st.session_state.selected_idx = idx
+                        st.session_state.curated_post = ""
+                        st.session_state.ai_parts = {}
+                        st.rerun()
+
+    selected_idx = st.session_state.selected_idx
+    item = candidates[min(selected_idx, len(candidates) - 1)]
+
+    # Inline preview of selected article
+    st.divider()
+    with st.container():
         c1, c2 = st.columns([2, 1])
         with c1:
-            st.markdown(f"### {item['title']}")
+            st.markdown(f"**📰 Selected:** {item['title']}")
             if item.get("summary"):
-                st.write(item["summary"])
+                st.caption(item["summary"])
         with c2:
-            st.markdown(f"**Source:** {item['source']}")
-            st.markdown(f"**Published:** {item['age']}")
-            st.markdown(f"**URL:** [Open article]({item['url']})")
+            st.markdown(f"**Source:** {item['source']}  \n**Published:** {item['age']}  \n[Open article ↗]({item['url']})")
 
     # ── Step 3: Generate post
     st.divider()
@@ -487,15 +522,9 @@ def main():
                 st.session_state.ai_parts = {}
                 st.rerun()
 
-    # ── Queue overview at the bottom
-    st.divider()
-    with st.expander(f"📋 Full Article Queue ({len(candidates)} articles)", expanded=False):
-        for i, art in enumerate(candidates):
-            marker = "👉 " if i == selected_idx else "   "
-            st.markdown(
-                f"{marker}**{i+1}.** [{art['title']}]({art['url']}) "
-                f"— *{art['source']}*, {art['age']}"
-            )
+
+
+
 
 
 if __name__ == "__main__":
