@@ -37,6 +37,7 @@ DEFAULT_CONFIG = {
         "https://techcrunch.com/feed/",
         "https://www.theverge.com/rss/index.xml",
         "https://feeds.feedburner.com/TheHackersNews",
+        "https://news.ycombinator.com/rss",
     ],
     "gnews_queries": [
         "enterprise AI productivity",
@@ -223,16 +224,26 @@ def call_openrouter_json(api_key: str, model: str, prompt: str, temperature: flo
     raise RuntimeError(f"OpenRouter request failed after 3 attempts: {last_err}")
 
 
-def build_prompt(item: dict, office_context: str) -> str:
+def build_prompt(items: list[dict], office_context: str) -> str:
+    articles_block = "\n\n".join(
+        f"Article {i}:\n"
+        f"  Title: {item['title']}\n"
+        f"  Source: {item['source']}\n"
+        f"  URL: {item['url']}\n"
+        f"  Summary: {item.get('summary', '(no summary)')}"
+        for i, item in enumerate(items, 1)
+    )
+    merge_note = (
+        "Synthesize all selected articles below into ONE cohesive Viva Engage digest post, "
+        "connecting common themes and including all source links.\n\n"
+        if len(items) > 1
+        else ""
+    )
     return f"""You are an enterprise communications specialist curating tech news for a Microsoft Viva Engage community.
 
 Audience: {office_context}
 
-Article:
-  Title: {item['title']}
-  Source: {item['source']}
-  URL: {item['url']}
-  Summary: {item.get('summary', '(no summary)')}
+{merge_note}{articles_block}
 
 Return ONLY a valid JSON object with these exact keys (no extra text before or after):
 {{
@@ -240,24 +251,40 @@ Return ONLY a valid JSON object with these exact keys (no extra text before or a
   "takeaways": ["point 1", "point 2", "point 3"],
   "why_it_matters": "1-2 sentences linking this to our team",
   "discussion_question": "one engaging question for employees",
-  "formatted_post": "full ready-to-paste Viva Engage post in markdown"
+  "formatted_post": "full ready-to-paste Viva Engage post in markdown (including all article URLs)"
 }}"""
 
 
-def build_post_from_parts(res: dict, item: dict) -> str:
+def build_post_from_parts(res: dict, items: list[dict]) -> str:
     """Fallback: stitch a post from individual fields if formatted_post is missing."""
-    headline = res.get("headline", item["title"])
+    headline = res.get("headline", items[0]["title"])
     takeaways = res.get("takeaways", [])
     why = res.get("why_it_matters", "")
     question = res.get("discussion_question", "")
     bullets = "\n".join(f"• {t}" for t in takeaways)
+    links = "\n".join(f"🔗 [{item['title']}]({item['url']})" for item in items)
     return (
         f"{headline}\n\n"
         f"**Key Takeaways:**\n{bullets}\n\n"
         f"**Why It Matters:**\n{why}\n\n"
         f"💬 {question}\n\n"
-        f"🔗 {item['url']}"
+        f"{links}"
     )
+
+
+def archive_selected(items: list[dict], selected_indices: list[int]) -> None:
+    """Record selected articles in posted_history.json and remove them from candidates."""
+    h = load_history()
+    for art in items:
+        h.update([art["id"], art["url"]])
+    save_history(h)
+    selected_set = set(selected_indices)
+    st.session_state.candidates = [
+        c for i, c in enumerate(st.session_state.candidates) if i not in selected_set
+    ]
+    st.session_state.selected_indices = []
+    st.session_state.curated_post = ""
+    st.session_state.ai_parts = {}
 
 
 # ── STREAMLIT UI ───────────────────────────────────────────────────────────────
@@ -267,7 +294,7 @@ def main():
     for key, default in [
         ("candidates", []),
         ("fetch_errors", []),
-        ("selected_idx", 0),
+        ("selected_indices", []),
         ("curated_post", ""),
         ("ai_parts", {}),
         ("last_fetched", None),
@@ -345,7 +372,7 @@ def main():
             candidates, errors = fetch_candidates(feed_urls, gnews_queries)
         st.session_state.candidates = candidates
         st.session_state.fetch_errors = errors
-        st.session_state.selected_idx = 0
+        st.session_state.selected_indices = []
         st.session_state.curated_post = ""
         st.session_state.ai_parts = {}
         st.session_state.last_fetched = datetime.now().strftime("%H:%M:%S")
@@ -363,9 +390,20 @@ def main():
         st.info("👆 Click **Fetch News** to pull articles from your configured feeds.")
         return
 
-    # ── Step 2: Article cards
+    # ── Step 2: Article cards (multi-select)
     st.divider()
-    st.subheader(f"Step 2 — Pick an Article ({len(candidates)} available)")
+    selected_indices = [i for i in st.session_state.selected_indices if i < len(candidates)]
+    st.session_state.selected_indices = selected_indices
+
+    hdr_col, clr_col = st.columns([4, 1])
+    with hdr_col:
+        st.subheader(f"Step 2 — Pick Articles ({len(selected_indices)} selected / {len(candidates)} available)")
+    with clr_col:
+        if selected_indices and st.button("Clear selection", use_container_width=True):
+            st.session_state.selected_indices = []
+            st.session_state.curated_post = ""
+            st.session_state.ai_parts = {}
+            st.rerun()
 
     # Inject CSS for card styling
     st.markdown("""
@@ -399,7 +437,7 @@ def main():
         cols = st.columns(COLS)
         for col, art in zip(cols, row_items):
             idx = candidates.index(art)
-            is_selected = (idx == st.session_state.selected_idx)
+            is_selected = idx in selected_indices
             card_class = "article-card selected" if is_selected else "article-card"
             with col:
                 st.markdown(
@@ -412,33 +450,40 @@ def main():
                 )
                 btn_label = "✅ Selected" if is_selected else "Select"
                 if col.button(btn_label, key=f"card_{idx}", use_container_width=True):
-                    if idx != st.session_state.selected_idx:
-                        st.session_state.selected_idx = idx
-                        st.session_state.curated_post = ""
-                        st.session_state.ai_parts = {}
-                        st.rerun()
+                    if is_selected:
+                        st.session_state.selected_indices.remove(idx)
+                    else:
+                        st.session_state.selected_indices.append(idx)
+                    st.session_state.curated_post = ""
+                    st.session_state.ai_parts = {}
+                    st.rerun()
 
-    selected_idx = st.session_state.selected_idx
-    item = candidates[min(selected_idx, len(candidates) - 1)]
+    selected_items = [candidates[i] for i in st.session_state.selected_indices]
+    if not selected_items:
+        st.info("👆 Select one or more article cards above to generate a post.")
+        return
 
-    # Inline preview of selected article
+    # Inline preview of selected articles
     st.divider()
-    with st.container():
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.markdown(f"**📰 Selected:** {item['title']}")
-            if item.get("summary"):
-                st.caption(item["summary"])
-        with c2:
-            st.markdown(f"**Source:** {item['source']}  \n**Published:** {item['age']}  \n[Open article ↗]({item['url']})")
+    st.markdown(f"**📰 Selected Articles ({len(selected_items)}):**")
+    for i, sel in enumerate(selected_items, 1):
+        with st.container():
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                st.markdown(f"**{i}. {sel['title']}**")
+                if sel.get("summary"):
+                    st.caption(sel["summary"])
+            with c2:
+                st.markdown(f"**{sel['source']}** · {sel['age']} · [Open ↗]({sel['url']})")
 
     # ── Step 3: Generate post
     st.divider()
     st.subheader("Step 3 — Generate Viva Engage Post")
 
+    btn_text = f"✨ Merge {len(selected_items)} Articles & Generate" if len(selected_items) > 1 else "✨ Generate with AI"
     gen_col, _ = st.columns([1, 3])
     with gen_col:
-        generate_clicked = st.button("✨ Generate with AI", type="primary", use_container_width=True)
+        generate_clicked = st.button(btn_text, type="primary", use_container_width=True)
 
     if generate_clicked:
         api_key_to_use = cfg.get("api_key") or OPENROUTER_API_KEY
@@ -448,9 +493,9 @@ def main():
         else:
             with st.spinner(f"Calling {model_to_use} via OpenRouter…"):
                 try:
-                    prompt = build_prompt(item, cfg.get("office_context", ""))
+                    prompt = build_prompt(selected_items, cfg.get("office_context", ""))
                     res = call_openrouter_json(api_key_to_use, model_to_use, prompt)
-                    post = res.get("formatted_post") or build_post_from_parts(res, item)
+                    post = res.get("formatted_post") or build_post_from_parts(res, selected_items)
                     st.session_state.curated_post = post
                     st.session_state.ai_parts = res
                     st.success("✅ Post generated!")
@@ -495,25 +540,13 @@ def main():
         c_post, c_dismiss, c_regen = st.columns(3)
         with c_post:
             if st.button("✅ Mark as Posted", use_container_width=True, type="primary"):
-                h = load_history()
-                h.update([item["id"], item["url"]])
-                save_history(h)
-                st.session_state.candidates.pop(selected_idx)
-                st.session_state.curated_post = ""
-                st.session_state.ai_parts = {}
-                st.session_state.selected_idx = 0
+                archive_selected(selected_items, st.session_state.selected_indices)
                 st.success("Marked as posted! Removed from queue.")
                 st.rerun()
 
         with c_dismiss:
-            if st.button("⏭️ Dismiss Article", use_container_width=True):
-                h = load_history()
-                h.update([item["id"], item["url"]])
-                save_history(h)
-                st.session_state.candidates.pop(selected_idx)
-                st.session_state.curated_post = ""
-                st.session_state.ai_parts = {}
-                st.session_state.selected_idx = 0
+            if st.button("⏭️ Dismiss Selected", use_container_width=True):
+                archive_selected(selected_items, st.session_state.selected_indices)
                 st.rerun()
 
         with c_regen:
