@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
 
 import feedparser
 import streamlit as st
@@ -108,6 +109,30 @@ def format_age(dt_utc: datetime) -> str:
     return f"{h // 24}d ago"
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_article_text(url: str, max_len: int = 1800) -> str:
+    """Best-effort extraction of readable article paragraphs from a URL."""
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=5) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            if "html" not in ctype.lower():
+                return ""
+            html = resp.read(300_000).decode("utf-8", errors="ignore")
+        soup = BeautifulSoup(html, "html.parser")
+        container = soup.find("article") or soup.find("main") or soup.body
+        if not container:
+            return ""
+        paras = [
+            re.sub(r"\s+", " ", p.get_text(" ", strip=True))
+            for p in container.find_all("p")
+        ]
+        body = "\n\n".join(p for p in paras if len(p) > 40)
+        return (body[: max_len - 3] + "…") if len(body) > max_len else body
+    except Exception:
+        return ""
+
+
 def fetch_candidates(feed_urls: list[str], gnews_queries: list[str]) -> list[dict]:
     seen_history = load_history()
     raw_items: list[dict] = []
@@ -127,6 +152,7 @@ def fetch_candidates(feed_urls: list[str], gnews_queries: list[str]) -> list[dic
                 link = entry.get("link", "").strip()
                 guid = entry.get("id", link).strip()
                 if link:
+                    raw_body = (entry.get("content") or [{}])[0].get("value") or entry.get("summary", "")
                     raw_items.append({
                         "id": guid,
                         "title": entry.get("title", "Untitled").strip(),
@@ -134,6 +160,7 @@ def fetch_candidates(feed_urls: list[str], gnews_queries: list[str]) -> list[dic
                         "url": link,
                         "published_utc": parse_utc(entry),
                         "summary": clean_html(entry.get("summary", "")),
+                        "content": clean_html(raw_body, max_len=1800),
                     })
         except Exception as e:
             errors.append(f"⚠️ Error fetching {url}: {e}")
@@ -165,6 +192,7 @@ def fetch_candidates(feed_urls: list[str], gnews_queries: list[str]) -> list[dic
                         "url": link,
                         "published_utc": parse_utc(entry),
                         "summary": clean_html(entry.get("summary", "")),
+                        "content": clean_html(entry.get("summary", ""), max_len=1800),
                     })
         except Exception as e:
             errors.append(f"⚠️ Google News error for '{query}': {e}")
@@ -283,6 +311,7 @@ def archive_selected(items: list[dict], selected_indices: list[int]) -> None:
         c for i, c in enumerate(st.session_state.candidates) if i not in selected_set
     ]
     st.session_state.selected_indices = []
+    st.session_state.active_idx = None
     st.session_state.curated_post = ""
     st.session_state.ai_parts = {}
 
@@ -295,6 +324,7 @@ def main():
         ("candidates", []),
         ("fetch_errors", []),
         ("selected_indices", []),
+        ("active_idx", None),
         ("curated_post", ""),
         ("ai_parts", {}),
         ("last_fetched", None),
@@ -373,6 +403,7 @@ def main():
         st.session_state.candidates = candidates
         st.session_state.fetch_errors = errors
         st.session_state.selected_indices = []
+        st.session_state.active_idx = None
         st.session_state.curated_post = ""
         st.session_state.ai_parts = {}
         st.session_state.last_fetched = datetime.now().strftime("%H:%M:%S")
@@ -401,6 +432,7 @@ def main():
     with clr_col:
         if selected_indices and st.button("Clear selection", use_container_width=True):
             st.session_state.selected_indices = []
+            st.session_state.active_idx = None
             st.session_state.curated_post = ""
             st.session_state.ai_parts = {}
             st.rerun()
@@ -431,12 +463,11 @@ def main():
     """, unsafe_allow_html=True)
 
     COLS = 3  # cards per row
-    rows = [candidates[i:i + COLS] for i in range(0, len(candidates), COLS)]
-
-    for row_items in rows:
+    for row_start in range(0, len(candidates), COLS):
+        row_items = candidates[row_start:row_start + COLS]
         cols = st.columns(COLS)
-        for col, art in zip(cols, row_items):
-            idx = candidates.index(art)
+        for offset, (col, art) in enumerate(zip(cols, row_items)):
+            idx = row_start + offset
             is_selected = idx in selected_indices
             card_class = "article-card selected" if is_selected else "article-card"
             with col:
@@ -452,11 +483,32 @@ def main():
                 if col.button(btn_label, key=f"card_{idx}", use_container_width=True):
                     if is_selected:
                         st.session_state.selected_indices.remove(idx)
+                        if st.session_state.active_idx == idx:
+                            sel = st.session_state.selected_indices
+                            st.session_state.active_idx = sel[-1] if sel else None
                     else:
                         st.session_state.selected_indices.append(idx)
+                        st.session_state.active_idx = idx
                     st.session_state.curated_post = ""
                     st.session_state.ai_parts = {}
                     st.rerun()
+
+        active_idx = st.session_state.active_idx
+        if active_idx is not None and row_start <= active_idx < row_start + len(row_items):
+            active_art = candidates[active_idx]
+            with st.container(border=True):
+                h_col, link_col = st.columns([4, 1])
+                with h_col:
+                    st.markdown(f"#### {active_art['title']}")
+                    st.caption(f"{active_art['source']} · {active_art['age']}")
+                with link_col:
+                    st.markdown(f"[Open article ↗]({active_art['url']})")
+                body = active_art.get("content") or active_art.get("summary") or ""
+                if len(body) < 200 or body.strip().lower() == "comments":
+                    fetched = fetch_article_text(active_art["url"])
+                    if fetched:
+                        body = fetched
+                st.write(body or "No preview content available for this link — click Open article above.")
 
     selected_items = [candidates[i] for i in st.session_state.selected_indices]
     if not selected_items:
