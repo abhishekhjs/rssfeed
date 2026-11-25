@@ -13,7 +13,7 @@ from dateutil import parser as date_parser
 from openai import OpenAI
 
 # --- CREDENTIALS & FILES ---
-OPENROUTER_API_KEY = ""  # Set your key in the sidebar or as env var OPENROUTER_API_KEY
+OPENROUTER_API_KEY = "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"
 # Best free model on OpenRouter as of Nov 2026 — fast, reliable JSON output
 FREE_MODEL = "nvidia/nemotron-3.5-lightning:free"
 
@@ -133,10 +133,16 @@ def fetch_article_text(url: str, max_len: int = 1800) -> str:
         return ""
 
 
-def fetch_candidates(feed_urls: list[str], gnews_queries: list[str]) -> list[dict]:
+def fetch_candidates(
+    feed_urls: list[str],
+    gnews_queries: list[str],
+    keyword: str = "",
+) -> tuple[list[dict], list[str]]:
     seen_history = load_history()
     raw_items: list[dict] = []
     errors: list[str] = []
+    kw = keyword.strip()
+    kw_terms = [t.lower() for t in kw.split()]
 
     for url in feed_urls:
         url = url.strip()
@@ -152,25 +158,37 @@ def fetch_candidates(feed_urls: list[str], gnews_queries: list[str]) -> list[dic
                 link = entry.get("link", "").strip()
                 guid = entry.get("id", link).strip()
                 if link:
+                    title = entry.get("title", "Untitled").strip()
                     raw_body = (entry.get("content") or [{}])[0].get("value") or entry.get("summary", "")
+                    summary = clean_html(entry.get("summary", ""))
+                    content = clean_html(raw_body, max_len=1800)
+                    if kw_terms:
+                        haystack = f"{title} {summary} {content}".lower()
+                        if not all(
+                            re.search(rf"\b{re.escape(t)}\b" if len(t) <= 3 else rf"\b{re.escape(t)}", haystack)
+                            for t in kw_terms
+                        ):
+                            continue
                     raw_items.append({
                         "id": guid,
-                        "title": entry.get("title", "Untitled").strip(),
+                        "title": title,
                         "source": feed_title,
                         "url": link,
                         "published_utc": parse_utc(entry),
-                        "summary": clean_html(entry.get("summary", "")),
-                        "content": clean_html(raw_body, max_len=1800),
+                        "summary": summary,
+                        "content": content,
                     })
         except Exception as e:
             errors.append(f"⚠️ Error fetching {url}: {e}")
 
-    for query in gnews_queries:
+    active_queries = [kw] if kw else gnews_queries
+    window = "7d" if kw else "1d"
+    for query in active_queries:
         query = query.strip()
         if not query:
             continue
         try:
-            encoded_q = quote_plus(f"{query} when:1d")
+            encoded_q = quote_plus(f"{query} when:{window}")
             gnews_url = (
                 f"https://news.google.com/rss/search?q={encoded_q}"
                 f"&hl=en-IN&gl=IN&ceid=IN:en"
@@ -224,6 +242,7 @@ def call_openrouter_json(api_key: str, model: str, prompt: str, temperature: flo
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key,
+        timeout=30.0,
         default_headers={
             "HTTP-Referer": "http://localhost:8501",
             "X-Title": "Viva-Engage-News-Curator",
@@ -258,7 +277,7 @@ def build_prompt(items: list[dict], office_context: str) -> str:
         f"  Title: {item['title']}\n"
         f"  Source: {item['source']}\n"
         f"  URL: {item['url']}\n"
-        f"  Summary: {item.get('summary', '(no summary)')}"
+        f"  Content: {item.get('content') or item.get('summary', '(no summary)')}"
         for i, item in enumerate(items, 1)
     )
     merge_note = (
@@ -273,13 +292,15 @@ Audience: {office_context}
 
 {merge_note}{articles_block}
 
+Write an engaging, informative post whose body content is around 100 words (roughly 90-120 words, excluding URLs) with concrete details, context, and practical takeaways.
+
 Return ONLY a valid JSON object with these exact keys (no extra text before or after):
 {{
   "headline": "catchy headline with 1 emoji",
-  "takeaways": ["point 1", "point 2", "point 3"],
-  "why_it_matters": "1-2 sentences linking this to our team",
+  "takeaways": ["detailed point 1", "detailed point 2", "detailed point 3"],
+  "why_it_matters": "2-3 sentences explaining the practical impact for our team",
   "discussion_question": "one engaging question for employees",
-  "formatted_post": "full ready-to-paste Viva Engage post in markdown (including all article URLs)"
+  "formatted_post": "full ~100-word ready-to-paste Viva Engage post in markdown (including headline, takeaways, why it matters, discussion question, and all article URLs)"
 }}"""
 
 
@@ -328,6 +349,7 @@ def main():
         ("curated_post", ""),
         ("ai_parts", {}),
         ("last_fetched", None),
+        ("last_query", ""),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -389,17 +411,27 @@ def main():
             st.success("History cleared!")
             st.rerun()
 
-    # ── Step 1: Fetch
-    st.subheader("Step 1 — Fetch Latest News")
-    col_btn, col_info = st.columns([1, 3])
-    with col_btn:
-        fetch_clicked = st.button("🔄 Fetch News", type="primary", use_container_width=True)
+    # ── Step 1: Ask topic & fetch
+    st.subheader("Step 1 — What News Are You Looking For?")
+    with st.form("search_form", border=False):
+        col_kw, col_btn = st.columns([4, 1])
+        with col_kw:
+            keyword = st.text_input(
+                "Enter a topic or keyword (leave blank for all latest news):",
+                value=st.session_state.last_query,
+                placeholder="e.g. AI agents, cybersecurity, Microsoft Copilot, Nvidia…",
+            )
+        with col_btn:
+            st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+            fetch_clicked = st.form_submit_button("🔍 Find News", type="primary", use_container_width=True)
 
     if fetch_clicked:
-        with st.spinner("Fetching RSS feeds & Google News…"):
+        kw = keyword.strip()
+        label = f'for "{kw}"' if kw else "from all feeds"
+        with st.spinner(f"Searching news {label}…"):
             feed_urls = [f.strip() for f in feeds_text.splitlines() if f.strip()]
             gnews_queries = [q.strip() for q in gnews_text.splitlines() if q.strip()]
-            candidates, errors = fetch_candidates(feed_urls, gnews_queries)
+            candidates, errors = fetch_candidates(feed_urls, gnews_queries, keyword=kw)
         st.session_state.candidates = candidates
         st.session_state.fetch_errors = errors
         st.session_state.selected_indices = []
@@ -407,18 +439,24 @@ def main():
         st.session_state.curated_post = ""
         st.session_state.ai_parts = {}
         st.session_state.last_fetched = datetime.now().strftime("%H:%M:%S")
+        st.session_state.last_query = kw
 
-    with col_info:
-        if st.session_state.last_fetched:
-            n = len(st.session_state.candidates)
-            st.info(f"Last fetched at **{st.session_state.last_fetched}** — **{n}** new articles ready.")
+    if st.session_state.last_fetched:
+        n = len(st.session_state.candidates)
+        q_note = f' for **"{st.session_state.last_query}"**' if st.session_state.last_query else ""
+        st.info(f"Last searched at **{st.session_state.last_fetched}**{q_note} — **{n}** articles found.")
 
     for err in st.session_state.fetch_errors:
         st.warning(err)
 
     candidates = st.session_state.candidates
     if not candidates:
-        st.info("👆 Click **Fetch News** to pull articles from your configured feeds.")
+        msg = (
+            f'No articles matched **"{st.session_state.last_query}"** — try another keyword or leave blank for all latest news.'
+            if st.session_state.last_fetched and st.session_state.last_query
+            else "👆 Enter a topic (or leave blank) and click **Find News**."
+        )
+        st.info(msg)
         return
 
     # ── Step 2: Article cards (multi-select)
